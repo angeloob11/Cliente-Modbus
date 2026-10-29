@@ -1,91 +1,160 @@
-import socket
-import struct
+"""modbus_cli.py: ejecuta una sola petición Modbus TCP con la biblioteca propia.
+
+Uso:
+    python3 modbus_cli.py [--ip IP] [--puerto P] [--unidad U] [--timeout S] [--traza]
+                          ORDEN ARGUMENTOS
+
+Códigos de salida: 0 OK, 2 argumento inválido, 3 excepción Modbus,
+4 timeout, 5 error de conexión, 6 error de protocolo.
+"""
+import argparse
+import sys
+
+from modbus_tcp import (AUTOR, ArgumentoInvalido, ClienteModbusSeguro,
+                        ErrorConexion, ErrorProtocolo, ErrorTimeout,
+                        ExcepcionModbus)
+
+SALIDA_OK = 0
+SALIDA_ARGUMENTO = 2
+SALIDA_EXCEPCION = 3
+SALIDA_TIMEOUT = 4
+SALIDA_CONEXION = 5
+SALIDA_PROTOCOLO = 6
 
 
-HOST = "127.0.0.1"
-PORT = 502
-PROTOCOL_ID = 0
-UNIT_ID = 0XFF
+class ParserModbus(argparse.ArgumentParser):
+    """argparse que informa de los errores con el formato del guion."""
 
-class RespuestaModbus(bytes):
-    def __new__(cls, datos: bytes, cantidad: int):
-        obj = super().__new__(cls, datos)
-        obj.cantidad = cantidad
-        return obj
+    def error(self, message):
+        print(f"ARGUMENTO INVALIDO: {message}")
+        sys.exit(SALIDA_ARGUMENTO)
 
 
-class RespuestaBits(RespuestaModbus):
-    def to_binary(self) -> list[int]:
-        return [(self[i // 8] >> (i % 8)) & 1
-                for i in range(self.cantidad)]
+def entero(texto: str) -> int:
+    """Admite decimal, hexadecimal (0x..) o negativo."""
+    try:
+        return int(texto, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{texto}' no es un entero")
 
 
-class RespuestaRegistros(RespuestaModbus):
-    def to_int(self) -> list[int]:
-        return list(struct.unpack(f">{self.cantidad}H", self))
-
-    def to_signed(self) -> list[int]:
-        return list(struct.unpack(f">{self.cantidad}h", self))
-
-
-
-class ClienteModbusTCP(socket.socket):
-    def __init__(self, HOST:str, PORT:int):
-        super().__init__(socket.AF_INET, socket.SOCK_STREAM)
-        self.HOST = HOST
-        self.PORT = PORT
-        self.TransactionID = 0
-        self.conectar()
-
-    def conectar(self)->None:
-        self.connect((self.HOST, self.PORT))
-
-    def ejecutar(self, mensaje:bytes)->bytes:
-        MBAP = self.CabeceraMBAP(mensaje)
-        datos = MBAP + mensaje 
-        #print(datos)
-        self.sendall(datos)
-        self.TransactionID += 1
-        MBAP_recibido = struct.unpack('>HHHB', self.recv(7))
-        pdu = self.recv(MBAP_recibido[2]-1)
-        return pdu
-
-    def leer(self, function:int, start:int, cantidad:int)->bytes:
-        return self.ejecutar(function.to_bytes(1, 'big')+start.to_bytes(2, 'big')+cantidad.to_bytes(2,'big'))
+def lista_valores(textos: list[str]) -> list[int]:
+    """Acepta '10 258', '10,258' y, para bits, una cadena como '1011'."""
+    partes = [p for t in textos for p in t.replace(",", " ").split()]
+    if len(partes) == 1 and len(partes[0]) > 1 and set(partes[0]) <= {"0", "1"}:
+        return [int(c) for c in partes[0]]
+    try:
+        return [int(p, 0) for p in partes]
+    except ValueError:
+        raise ArgumentoInvalido(f"valores no válidos: {' '.join(textos)}")
 
 
-    def cerrar(self)->None:
-        self.close()
+def crear_parser() -> ParserModbus:
+    p = ParserModbus(prog="modbus_cli.py",
+                     description=f"Cliente Modbus TCP (autor: {AUTOR})")
+    p.add_argument("--ip", default="127.0.0.1")
+    p.add_argument("--puerto", type=entero, default=5020)
+    p.add_argument("--unidad", type=entero, default=0xFF)
+    p.add_argument("--timeout", type=float, default=3.0)
+    p.add_argument("--traza", action="store_true", help="muestra TX/RX en hexadecimal")
 
-    def CabeceraMBAP(self, msg:bytes)->bytes:
-        return struct.pack('>H',self.TransactionID)+struct.pack('>H',PROTOCOL_ID)+struct.pack('>H',len(msg)+1)+struct.pack('>B',UNIT_ID)
-
-    #FUNCION 1
-    def LeerCoils(self, inicio:int, numero_coils:int)->bytes:
-        pdu = self.leer(1, inicio, numero_coils)
-        return RespuestaBits(pdu[2:], numero_coils)
-
-    #FUNCION 2
-    def LeerDiscreteInputs(self, inicio:int, numero_coils:int)->bytes:
-        pdu = self.leer(2, inicio, numero_coils)
-        return RespuestaBits(pdu[2:], numero_coils)
-
-    #FUNCION 3
-    def ReadHoldingRegisters(self, inicio: int, numero_registros: int) -> RespuestaRegistros:
-        pdu = self.leer(3, inicio, numero_registros)
-        return RespuestaRegistros(pdu[2:], numero_registros)
-
-    #FUNCION 4
-    def ReadInputRegisters(self, inicio: int, numero_registros: int) -> RespuestaRegistros:
-        pdu = self.leer(4, inicio, numero_registros)
-        return RespuestaRegistros(pdu[2:], numero_registros)
+    ordenes = p.add_subparsers(dest="orden", required=True, parser_class=ParserModbus)
+    for nombre in ("leer-coils", "leer-entradas", "leer-holding", "leer-input"):
+        o = ordenes.add_parser(nombre)
+        o.add_argument("direccion", type=entero)
+        o.add_argument("cantidad", type=entero)
+    for nombre in ("escribir-coil", "escribir-registro"):
+        o = ordenes.add_parser(nombre)
+        o.add_argument("direccion", type=entero)
+        o.add_argument("valor", type=entero)
+    for nombre in ("escribir-coils", "escribir-registros"):
+        o = ordenes.add_parser(nombre)
+        o.add_argument("direccion", type=entero)
+        o.add_argument("valores", nargs="+")
+    o = ordenes.add_parser("leer-escribir")
+    o.add_argument("dir_lectura", type=entero)
+    o.add_argument("cantidad", type=entero)
+    o.add_argument("dir_escritura", type=entero)
+    o.add_argument("valores", nargs="+")
+    return p
 
 
-def main():
-    MyCliente = ClienteModbusTCP(HOST, PORT)
-    RESPONSE1 = MyCliente.ReadInputRegisters(4, 5)
-    print(f'respuesta de los registros {RESPONSE1.to_int()}')
-    MyCliente.cerrar()
+def imprimir_bits(inicio: int, bits: list[int]) -> None:
+    for i, b in enumerate(bits):
+        print(f"{inicio + i} {b}")
+
+
+def imprimir_registros(inicio: int, valores: list[int]) -> None:
+    for i, v in enumerate(valores):
+        con_signo = v - 0x10000 if v >= 0x8000 else v
+        print(f"{inicio + i} {v} {con_signo} 0x{v:04X}")
+
+
+def ejecutar_orden(cliente: ClienteModbusSeguro, a: argparse.Namespace) -> None:
+    orden = a.orden
+    if orden == "leer-coils":
+        imprimir_bits(a.direccion, cliente.leer_coils(a.direccion, a.cantidad))
+    elif orden == "leer-entradas":
+        imprimir_bits(a.direccion, cliente.leer_entradas_discretas(a.direccion, a.cantidad))
+    elif orden == "leer-holding":
+        imprimir_registros(a.direccion, cliente.leer_holding_registers(a.direccion, a.cantidad))
+    elif orden == "leer-input":
+        imprimir_registros(a.direccion, cliente.leer_input_registers(a.direccion, a.cantidad))
+    elif orden == "escribir-coil":
+        cliente.escribir_coil(a.direccion, a.valor)
+        print("OK")
+    elif orden == "escribir-registro":
+        cliente.escribir_registro(a.direccion, a.valor)
+        print("OK")
+    elif orden == "escribir-coils":
+        cliente.escribir_coils(a.direccion, lista_valores(a.valores))
+        print("OK")
+    elif orden == "escribir-registros":
+        cliente.escribir_registros(a.direccion, lista_valores(a.valores))
+        print("OK")
+    elif orden == "leer-escribir":
+        leidos = cliente.leer_escribir_registros(a.dir_lectura, a.cantidad,
+                                                 a.dir_escritura, lista_valores(a.valores))
+        imprimir_registros(a.dir_lectura, leidos)
+
+
+def validar_previo(a: argparse.Namespace) -> None:
+    """Comprueba los argumentos antes de conectar, para no abrir el socket en balde."""
+    from modbus_tcp import validar_rango
+    validar_rango("puerto", a.puerto, 1, 65535)
+    validar_rango("unidad", a.unidad, 0, 255)
+    if a.timeout <= 0:
+        raise ArgumentoInvalido(f"timeout={a.timeout} debe ser positivo")
+
+
+def main(argv=None) -> int:
+    args = crear_parser().parse_args(argv)
+    cliente = None
+    try:
+        validar_previo(args)
+        cliente = ClienteModbusSeguro(args.ip, args.puerto, unidad=args.unidad,
+                                      timeout=args.timeout, traza=args.traza)
+        ejecutar_orden(cliente, args)
+        return SALIDA_OK
+    except ArgumentoInvalido as e:
+        print(f"ARGUMENTO INVALIDO: {e}")
+        return SALIDA_ARGUMENTO
+    except ExcepcionModbus as e:
+        print(f"EXCEPCION 0x{e.codigo:02X} {e.nombre}")
+        return SALIDA_EXCEPCION
+    except ErrorTimeout:
+        print("TIMEOUT")
+        return SALIDA_TIMEOUT
+    except ErrorConexion as e:
+        print(f"ERROR DE CONEXION: {e}")
+        return SALIDA_CONEXION
+    except ErrorProtocolo as e:
+        print(f"ERROR DE PROTOCOLO: {e}")
+        return SALIDA_PROTOCOLO
+    finally:
+        if cliente is not None:
+            cliente.close()
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
